@@ -137,7 +137,16 @@ class PolygonClient:
                     logger.info(f"Got underlying price for {symbol}: ${price:.2f}")
                     return price
 
-            # Fallback to previous close
+            # Plans without trade data (e.g. Starter) omit lastTrade from the
+            # snapshot but still return the current session's bars: the latest
+            # minute bar, then the day bar. Both are zero/absent before the open.
+            for bar in ('min', 'day'):
+                price = float((ticker_data.get(bar) or {}).get('c', 0) or 0)
+                if price > 0:
+                    logger.info(f"Got underlying price for {symbol} from {bar} bar: ${price:.2f}")
+                    return price
+
+            # Last resort: previous close (stale by up to a session)
             if 'prevDay' in ticker_data:
                 price = float(ticker_data['prevDay'].get('c', 0))
                 if price > 0:

@@ -1,8 +1,9 @@
 """
 Unit tests for GEX calculation engine.
 """
+import numpy as np
 import pytest
-from datetime import datetime
+from datetime import date, datetime, timedelta, timezone
 
 import sys
 from pathlib import Path
@@ -13,6 +14,8 @@ from gex_calculator import (
     compute_option_dex,
     aggregate_gex,
     find_gamma_flip_point,
+    compute_gamma_profile,
+    find_profile_flip_point,
     analyze_symbol_gex,
     get_gex_interpretation
 )
@@ -379,3 +382,54 @@ class TestGEXCalculatorIntegration:
 
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
+
+
+class TestGammaProfileFlip:
+    """Gamma flip from the full book re-priced across spot."""
+
+    NOW = datetime.now(timezone.utc)
+
+    @staticmethod
+    def _opt(strike, kind, oi, gamma=0.02, iv=0.2, exp=None):
+        # ~30 days out from the real clock, so gamma is peaked rather than flat
+        exp = exp or (date.today() + timedelta(days=30)).isoformat()
+        return {'strike': strike, 'type': kind, 'open_interest': oi, 'gamma': gamma,
+                'implied_volatility': iv, 'expiration': exp}
+
+    def test_profile_at_spot_matches_net_gex(self):
+        """Anchoring to provider gamma makes G(spot) equal the reported net GEX."""
+        spot = 400.0
+        # Provider gamma consistent with the contract's BS gamma at spot.
+        options = [self._opt(400, 'call', 5000), self._opt(400, 'put', 8000),
+                   self._opt(390, 'put', 6000), self._opt(410, 'call', 4000)]
+        agg = aggregate_gex(options, spot)
+        spots, total = compute_gamma_profile(options, spot, now=self.NOW)
+        mid = len(spots) // 2
+        assert spots[mid] == pytest.approx(spot)
+        # k is clamped, so allow a tolerance rather than exact equality
+        assert np.sign(total[mid]) == np.sign(agg['net_gex'])
+
+    def test_put_heavy_book_flips_above_spot(self):
+        """Dealers net short gamma at spot, long above: flip is above spot."""
+        spot = 400.0
+        options = [self._opt(400, 'put', 30000), self._opt(395, 'put', 20000),
+                   self._opt(420, 'call', 20000), self._opt(425, 'call', 10000)]
+        spots, total = compute_gamma_profile(options, spot, now=self.NOW)
+        flip = find_profile_flip_point(spots, total, spot)
+        assert flip is not None
+        assert flip > spot
+
+    def test_no_usable_contracts(self):
+        """Missing IV or past expiry yields an empty profile and no flip."""
+        options = [self._opt(400, 'call', 100, iv=0), self._opt(400, 'put', 100, exp='2020-01-01')]
+        spots, total = compute_gamma_profile(options, 400.0, now=self.NOW)
+        assert len(spots) == 0
+        assert find_profile_flip_point(spots, total, 400.0) is None
+
+    def test_analyze_symbol_uses_profile_flip(self):
+        """analyze_symbol_gex reports the profile flip, not a per-strike crossing."""
+        options = [self._opt(400, 'put', 30000), self._opt(395, 'put', 20000),
+                   self._opt(420, 'call', 20000), self._opt(425, 'call', 10000)]
+        result = analyze_symbol_gex('TEST', options, 400.0)
+        assert result.gamma_flip_point is not None
+        assert result.gamma_flip_point > 400.0

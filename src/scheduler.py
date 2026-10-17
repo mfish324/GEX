@@ -4,9 +4,10 @@ Scheduler for periodic GEX data refresh using APScheduler.
 Fetches options data, calculates GEX, and stores results in database
 at configurable intervals.
 """
+import inspect
 import logging
 import time
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import List, Optional
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -174,7 +175,27 @@ class GEXScheduler:
             # For now, get all active options (may be slow for high-volume symbols)
             expiration_config = self.config.app.get('expiration_filter', {})
 
-            if expiration_config.get('use_nearest_expiry', False):
+            book_kwargs = {}
+            if expiration_config.get('full_book', False):
+                # Whole book out to days_to_expiry_max: the gamma flip needs every
+                # expiry that contributes gamma, not just the nearest one.
+                if 'expiration_min' not in inspect.signature(self.client.get_options_snapshot).parameters:
+                    logger.warning("Data provider does not support full_book; using single expiry")
+                else:
+                    today = date.today()
+                    min_days = expiration_config.get('days_to_expiry_min', 0)
+                    max_days = expiration_config.get('days_to_expiry_max', 30)
+                    book_kwargs = {
+                        'expiration_min': (today + timedelta(days=min_days)).isoformat(),
+                        'expiration_max': (today + timedelta(days=max_days)).isoformat(),
+                        'max_options': expiration_config.get('max_options', 40000),
+                    }
+                    logger.info(f"Full book: expirations {book_kwargs['expiration_min']} "
+                                f"to {book_kwargs['expiration_max']}")
+
+            if book_kwargs:
+                expiration = None
+            elif expiration_config.get('use_nearest_expiry', False):
                 min_days = expiration_config.get('days_to_expiry_min', 0)
                 max_days = expiration_config.get('days_to_expiry_max', 60)
                 expiration = self.client.get_nearest_expiration(
@@ -194,7 +215,7 @@ class GEXScheduler:
                 logger.info("Fetching all expirations (this may take a while...)")
 
             # Fetch options data
-            options = self.client.get_options_snapshot(symbol, expiration=expiration)
+            options = self.client.get_options_snapshot(symbol, expiration=expiration, **book_kwargs)
 
             if not options:
                 logger.warning(f"No options data returned for {symbol}")

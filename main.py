@@ -51,7 +51,8 @@ def create_data_client(config: Config):
         from src.polygon_client import PolygonClient
         logger.info("Using Polygon.io as data provider")
         return PolygonClient(
-            api_key=config.env['POLYGON_API_KEY']
+            api_key=config.env['POLYGON_API_KEY'],
+            min_request_interval=config.app.get('polygon_request_interval_seconds', 12.0)
         )
     else:
         raise ValueError(f"Unknown data provider: {provider}")

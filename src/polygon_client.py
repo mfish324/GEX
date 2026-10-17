@@ -23,12 +23,14 @@ class PolygonClient:
     Handles authentication, rate limiting, and data normalization.
     """
 
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, min_request_interval: float = 12.0):
         """
         Initialize Polygon.io API client.
 
         Args:
             api_key: Polygon.io API key
+            min_request_interval: Seconds between requests (12 = free tier, 5/min;
+                paid tiers can go much lower)
         """
         self.api_key = api_key
         self.base_url = "https://api.polygon.io"
@@ -47,7 +49,7 @@ class PolygonClient:
 
         # Rate limiting
         self.last_request_time = 0
-        self.min_request_interval = 12.0  # Free tier: 5 calls/min = 12 sec between calls
+        self.min_request_interval = min_request_interval
 
         logger.info("Polygon.io client initialized")
 
@@ -148,7 +150,14 @@ class PolygonClient:
             logger.error(f"Failed to get underlying price for {symbol}: {e}")
             raise
 
-    def get_options_snapshot(self, symbol: str, expiration: Optional[str] = None) -> List[Dict]:
+    def get_options_snapshot(
+        self,
+        symbol: str,
+        expiration: Optional[str] = None,
+        expiration_min: Optional[str] = None,
+        expiration_max: Optional[str] = None,
+        max_options: int = 5000,
+    ) -> List[Dict]:
         """
         Fetch options data with Greeks and open interest for a symbol.
 
@@ -156,7 +165,10 @@ class PolygonClient:
 
         Args:
             symbol: Underlying ticker symbol (e.g., 'SPY')
-            expiration: Optional expiration date filter (YYYY-MM-DD)
+            expiration: Optional single expiration date filter (YYYY-MM-DD)
+            expiration_min: Optional earliest expiration (inclusive) for a multi-expiry book
+            expiration_max: Optional latest expiration (inclusive) for a multi-expiry book
+            max_options: Safety cap on contracts fetched across all pages
 
         Returns:
             List of dictionaries, each containing:
@@ -187,6 +199,10 @@ class PolygonClient:
 
         if expiration:
             params['expiration_date'] = expiration
+        if expiration_min:
+            params['expiration_date.gte'] = expiration_min
+        if expiration_max:
+            params['expiration_date.lte'] = expiration_max
 
         all_options = []
 
@@ -210,7 +226,7 @@ class PolygonClient:
 
             # Handle pagination if needed
             next_url = data.get('next_url')
-            while next_url and len(all_options) < 5000:  # Safety limit
+            while next_url and len(all_options) < max_options:  # Safety limit
                 logger.info(f"Fetching next page of options...")
                 self._rate_limit()
 

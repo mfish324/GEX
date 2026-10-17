@@ -5,6 +5,8 @@ Implements industry-standard formulas for options exposure calculation,
 aggregation, and gamma flip point detection.
 """
 import logging
+import math
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from collections import defaultdict
@@ -295,6 +297,102 @@ def find_gamma_flip_point(per_strike_net_gex: Dict[float, float], underlying_pri
     return None
 
 
+# Gamma-profile scan range (fraction of spot) and resolution.
+PROFILE_RANGE_PCT = 0.15
+PROFILE_POINTS = 121
+# Floor on time to expiry so 0DTE contracts keep a finite gamma (~half a trading hour).
+MIN_YEARS_TO_EXPIRY = 0.5 / (365 * 24)
+_SQRT_2PI = math.sqrt(2 * math.pi)
+# Bounds on the provider-gamma / Black-Scholes-gamma anchor factor.
+K_MIN, K_MAX = 0.25, 4.0
+
+
+def _years_to_expiry(expiration: str, now: datetime) -> Optional[float]:
+    """Years from now to the 16:00 ET close (20:00 UTC) of the expiration date."""
+    try:
+        exp = datetime.strptime(expiration[:10], '%Y-%m-%d').replace(hour=20, tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return None
+    years = (exp - now).total_seconds() / (365 * 86400)
+    return years if years > 0 else None
+
+
+def compute_gamma_profile(
+    options: List[Dict],
+    underlying_price: float,
+    contract_multiplier: int = 100,
+    now: Optional[datetime] = None,
+    range_pct: float = PROFILE_RANGE_PCT,
+    points: int = PROFILE_POINTS,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Total dealer gamma exposure as a function of hypothetical spot.
+
+    Re-prices Black-Scholes gamma for every contract in the book at each trial
+    spot (using each contract's own IV and expiry, rates and dividends ignored),
+    then sums with the same sign convention as compute_option_gex (calls +,
+    puts -): G(S) = sum(sign * k * gamma_BS(S) * OI * multiplier * S * 0.01).
+
+    k anchors each contract to the provider's own gamma at the current spot
+    (k = provider gamma / BS gamma at spot), so G(spot) equals net_gex and the
+    sign of the profile at spot always agrees with the reported regime. BS
+    only supplies how gamma moves as spot moves. Contracts with no provider
+    gamma use k = 1. Contracts without a usable IV, strike or future expiry
+    are skipped.
+
+    Returns:
+        (spots, total_gex) arrays; both empty if no contract was usable.
+    """
+    now = now or datetime.now(timezone.utc)
+    rows = []
+    for opt in options:
+        iv = opt.get('implied_volatility') or 0
+        strike = opt.get('strike') or 0
+        oi = opt.get('open_interest') or 0
+        years = _years_to_expiry(opt.get('expiration', ''), now)
+        kind = opt.get('type', '').lower()
+        if iv <= 0 or strike <= 0 or oi <= 0 or years is None or kind not in ('call', 'put'):
+            continue
+        rows.append((strike, iv, max(years, MIN_YEARS_TO_EXPIRY), oi,
+                     1.0 if kind == 'call' else -1.0, opt.get('gamma') or 0))
+
+    if not rows:
+        return np.array([]), np.array([])
+
+    strike, iv, years, oi, sign, gamma_provider = (np.array(c) for c in zip(*rows))
+    sd = iv * np.sqrt(years)
+
+    def bs_gamma(s_):
+        d1 = (np.log(s_ / strike) + 0.5 * iv ** 2 * years) / sd
+        return np.exp(-0.5 * d1 ** 2) / (_SQRT_2PI * s_ * sd)
+
+    gamma_at_spot = bs_gamma(underlying_price)
+    # Anchor only where both gammas are meaningful; clamp k so a deep-OTM contract
+    # (BS gamma ~0 at spot) cannot blow up when spot moves toward its strike.
+    anchorable = (gamma_provider > 0) & (gamma_at_spot > 1e-12)
+    k = np.where(anchorable, gamma_provider / np.where(anchorable, gamma_at_spot, 1.0), 1.0)
+    k = np.clip(k, K_MIN, K_MAX)
+    spots = np.linspace(underlying_price * (1 - range_pct), underlying_price * (1 + range_pct), points)
+    total = np.empty(points)
+    for j, s_ in enumerate(spots):
+        total[j] = np.sum(sign * k * bs_gamma(s_) * oi) * contract_multiplier * s_ * 0.01
+    return spots, total
+
+
+def find_profile_flip_point(spots: np.ndarray, total_gex: np.ndarray, underlying_price: float) -> Optional[float]:
+    """Spot at which the total-gamma profile crosses zero (nearest to spot), or None."""
+    if len(spots) < 2:
+        return None
+    crossings = []
+    for i in range(len(spots) - 1):
+        a, b = total_gex[i], total_gex[i + 1]
+        if (a > 0 > b) or (a < 0 < b):
+            crossings.append(spots[i] + (-a / (b - a)) * (spots[i + 1] - spots[i]))
+    if not crossings:
+        return None
+    return float(min(crossings, key=lambda f: abs(f - underlying_price)))
+
+
 def analyze_symbol_gex(
     symbol: str,
     options: List[Dict],
@@ -323,14 +421,10 @@ def analyze_symbol_gex(
     # Aggregate GEX across all options
     agg = aggregate_gex(options, underlying_price, contract_multiplier)
 
-    # Extract per-strike net GEX for flip point calculation
-    per_strike_net_gex = {
-        strike: data['net_gex']
-        for strike, data in agg['per_strike'].items()
-    }
-
-    # Find gamma flip point
-    flip_point = find_gamma_flip_point(per_strike_net_gex, underlying_price)
+    # Gamma flip: where total dealer gamma, re-priced across spot, changes sign.
+    # None if the book has no sign change within the scan range or no usable IVs.
+    spots, profile = compute_gamma_profile(options, underlying_price, contract_multiplier)
+    flip_point = find_profile_flip_point(spots, profile, underlying_price)
 
     # Create StrikeExposure objects
     strike_exposures = {}

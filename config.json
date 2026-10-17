@@ -1,6 +1,7 @@
 {
   "symbols": [
-    "SPY"
+    "SPY",
+    "QQQ"
   ],
   "refresh_interval_minutes": 15,
   "contract_multipliers": {
@@ -14,10 +15,13 @@
     "show_cumulative": true
   },
   "data_retention_days": 7,
-  "sample_mode": true,
+  "sample_mode": false,
   "expiration_filter": {
     "use_nearest_expiry": true,
     "days_to_expiry_min": 0,
-    "days_to_expiry_max": 30
-  }
+    "days_to_expiry_max": 30,
+    "full_book": true,
+    "max_options": 40000
+  },
+  "polygon_request_interval_seconds": 0.5
 }

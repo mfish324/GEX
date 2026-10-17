@@ -234,6 +234,30 @@ class TestFindGammaFlipPoint:
         # All positive, no flip
         assert flip is None
 
+    def test_ignores_far_otm_crossing(self):
+        """A noisy sign change far below spot must not be reported as the flip."""
+        per_strike_net_gex = {
+            300: -10, 305: 5,                      # deep-OTM noise, ~50% below spot
+            390: -500000, 395: -200000,
+            400: 100000, 405: 300000,
+        }
+
+        flip = find_gamma_flip_point(per_strike_net_gex, 400.0)
+
+        assert flip is not None
+        assert 395 < flip < 400
+
+    def test_picks_crossing_nearest_spot(self):
+        """With several crossings, return the one closest to spot."""
+        per_strike_net_gex = {
+            350: 100, 355: -100,                   # crossing near 352.5
+            395: -100, 400: 100,                   # crossing near 397.5
+        }
+
+        flip = find_gamma_flip_point(per_strike_net_gex, 398.0)
+
+        assert 395 < flip < 400
+
     def test_empty_data(self):
         """Test with empty data."""
         flip = find_gamma_flip_point({}, 400.0)

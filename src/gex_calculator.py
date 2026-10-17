@@ -234,6 +234,10 @@ def aggregate_gex(
     return result
 
 
+# Only zero crossings within this fraction of spot count as a gamma flip.
+FLIP_WINDOW_PCT = 0.20
+
+
 def find_gamma_flip_point(per_strike_net_gex: Dict[float, float], underlying_price: float) -> Optional[float]:
     """
     Find the gamma flip point where net GEX crosses zero.
@@ -252,6 +256,7 @@ def find_gamma_flip_point(per_strike_net_gex: Dict[float, float], underlying_pri
         1. Sort strikes and net GEX values
         2. Look for sign change in net GEX
         3. Use linear interpolation to estimate exact flip point
+        4. Keep crossings within FLIP_WINDOW_PCT of spot; return the nearest to spot
     """
     if not per_strike_net_gex:
         return None
@@ -260,25 +265,30 @@ def find_gamma_flip_point(per_strike_net_gex: Dict[float, float], underlying_pri
     strikes = sorted(per_strike_net_gex.keys())
     net_gex_values = [per_strike_net_gex[s] for s in strikes]
 
-    # Find where net GEX crosses zero
+    # Collect every zero crossing within a window around spot. Deep-OTM strikes
+    # have near-zero net GEX whose sign is set by a few stray contracts, so a
+    # crossing far from spot is noise (e.g. SPY "flip" at 449 with spot at 772).
+    lo = underlying_price * (1 - FLIP_WINDOW_PCT)
+    hi = underlying_price * (1 + FLIP_WINDOW_PCT)
+    crossings = []
     for i in range(len(net_gex_values) - 1):
         current_gex = net_gex_values[i]
         next_gex = net_gex_values[i + 1]
 
-        # Check for sign change
         if (current_gex > 0 and next_gex < 0) or (current_gex < 0 and next_gex > 0):
-            # Linear interpolation to find zero crossing
             current_strike = strikes[i]
             next_strike = strikes[i + 1]
+            ratio = -current_gex / (next_gex - current_gex)
+            flip_point = current_strike + ratio * (next_strike - current_strike)
+            if lo <= flip_point <= hi:
+                crossings.append(flip_point)
 
-            # Interpolate: flip_point = strike where GEX = 0
-            if next_gex != current_gex:
-                ratio = -current_gex / (next_gex - current_gex)
-                flip_point = current_strike + ratio * (next_strike - current_strike)
-
-                logger.info(f"Gamma flip point found: ${flip_point:.2f} "
-                          f"(between strikes ${current_strike:.0f} and ${next_strike:.0f})")
-                return flip_point
+    if crossings:
+        # Several crossings are possible; the one nearest spot is the relevant level.
+        flip_point = min(crossings, key=lambda f: abs(f - underlying_price))
+        logger.info(f"Gamma flip point found: ${flip_point:.2f} "
+                    f"({len(crossings)} crossing(s) within {FLIP_WINDOW_PCT:.0%} of spot)")
+        return flip_point
 
     # No flip point found
     logger.info("No gamma flip point detected in current strike range")
